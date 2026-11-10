@@ -13,6 +13,7 @@ A股自选股智能分析系统 - AI分析层
 import json
 import logging
 import math
+import os
 import re
 import time
 from dataclasses import dataclass
@@ -1267,6 +1268,9 @@ def _apply_hold_watch_dashboard(
         dashboard["core_conclusion"] = core
     core["signal_type"] = "🟡持有观望" if language == "zh" else "🟡 Hold / Watch"
     core["one_sentence"] = f"{advice}：{reason}" if language == "zh" else f"{advice}: {reason}"
+    _trigger_note = dashboard.get("trigger_note")
+    if _trigger_note:
+        core["one_sentence"] = f"{core['one_sentence']} ｜ {_trigger_note}"
 
     position_advice = core.get("position_advice")
     if not isinstance(position_advice, dict):
@@ -1678,6 +1682,92 @@ def populate_decision_action_fields(
     result.action = fields["action"]
     result.action_label = fields["action_label"]
     return result
+
+
+# ========== 预设触发价提示（STOCK_TRIGGERS）==========
+# 环境变量格式：STOCK_TRIGGERS="510050:2.84,600036:40,MSFT:487,GOOGL:263"
+# 默认含义为 "价格 <= 预设价 即触发"；写成 "MSFT:>=600" 表示 "价格 >= 预设价 即触发"。
+# 判断与差距全部由代码计算，不经过 LLM；没有配置预设价的股票不受任何影响。
+def _normalize_trigger_code(code: Any) -> str:
+    text = str(code or "").strip().upper()
+    text = re.sub(r"\.(SS|SZ|SH|HK)$", "", text)
+    m = re.fullmatch(r"HK(\d{1,5})", text)
+    if m:
+        return m.group(1).zfill(5)
+    if re.fullmatch(r"\d{1,5}", text):
+        return text.zfill(5)
+    return text
+
+
+def _parse_stock_triggers(raw: Optional[str]) -> Dict[str, Tuple[str, float]]:
+    triggers: Dict[str, Tuple[str, float]] = {}
+    for item in re.split(r"[,;\n]+", raw or ""):
+        item = item.strip()
+        if not item or ":" not in item:
+            continue
+        code, cond = item.split(":", 1)
+        cond = cond.strip()
+        op = "<="
+        if cond.startswith(">="):
+            op, cond = ">=", cond[2:]
+        elif cond.startswith("<="):
+            cond = cond[2:]
+        try:
+            price = float(cond.strip())
+        except ValueError:
+            continue
+        triggers[_normalize_trigger_code(code)] = (op, price)
+    return triggers
+
+
+def _build_trigger_note(code: Any, context: Dict[str, Any], language: str = "zh") -> Optional[str]:
+    spec = _parse_stock_triggers(os.getenv("STOCK_TRIGGERS", "")).get(_normalize_trigger_code(code))
+    if not spec:
+        return None
+    op, trigger = spec
+    today = context.get("today") or {}
+    realtime = context.get("realtime") or {}
+    price = None
+    label_zh, label_en = "收盘价", "close"
+    for value, lz, le in ((today.get("close"), "收盘价", "close"), (realtime.get("price"), "最新价", "last price")):
+        try:
+            candidate = float(value)
+        except (TypeError, ValueError):
+            continue
+        if candidate > 0:
+            price, label_zh, label_en = candidate, lz, le
+            break
+    if price is None:
+        return None
+    date = context.get("date") or today.get("date") or ""
+    hit = price <= trigger if op == "<=" else price >= trigger
+    sign = "≤" if op == "<=" else "≥"
+    gap = abs(price - trigger) / price * 100
+    if language == "en":
+        status = "TRIGGERED ✅" if hit else (
+            f"not triggered, needs to {'fall' if op == '<=' else 'rise'} {gap:.1f}%"
+        )
+        return f"🎯 Preset trigger {sign}{trigger:g}: based on {date} {label_en} {price:.2f} — {status}"
+    status = "已触发 ✅" if hit else f"未触发，还需{'下跌' if op == '<=' else '上涨'} {gap:.1f}%"
+    return f"🎯 预设触发价 {sign}{trigger:g}：以{date}{label_zh}{price:.2f}计，{status}"
+
+
+def _apply_trigger_note(result: "AnalysisResult", context: Dict[str, Any], code: Any, language: str = "zh") -> None:
+    """把触发价状态追加到分析结果；任何异常都不影响原有分析。"""
+    try:
+        note = _build_trigger_note(code, context, language)
+        if not note:
+            return
+        result.analysis_summary = f"{result.analysis_summary}\n\n{note}" if result.analysis_summary else note
+        dashboard = result.dashboard if isinstance(result.dashboard, dict) else None
+        if dashboard is not None:
+            dashboard["trigger_note"] = note
+            core = dashboard.get("core_conclusion")
+            if isinstance(core, dict):
+                one = str(core.get("one_sentence") or "").strip()
+                core["one_sentence"] = f"{one} ｜ {note}" if one else note
+    except Exception as exc:  # pragma: no cover - 兜底，保证原有流程不受影响
+        logger.warning("[trigger] 预设触发价提示生成失败，已跳过: %s", exc)
 
 
 class GeminiAnalyzer:
@@ -2884,6 +2974,8 @@ class GeminiAnalyzer:
             persist_llm_usage(llm_usage, model_used, call_type="analysis", stock_code=code)
 
             logger.info(f"[LLM解析] {name}({code}) 分析完成: {result.trend_prediction}, 评分 {result.sentiment_score}")
+
+            _apply_trigger_note(result, context, code, report_language)
 
             return result
             
